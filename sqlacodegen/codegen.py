@@ -2,6 +2,7 @@
 from __future__ import unicode_literals, division, print_function, absolute_import
 
 import inspect
+import inflection
 import re
 import sys
 from collections import defaultdict
@@ -37,6 +38,16 @@ try:
 except ImportError:
     pass
 
+# TODO - Figure out better way to do this...
+# Need to add relationship overrides and ForeignKey overrides...
+# Will allow for view relationships...
+config = {
+    "default_schema": "public",
+    "column_name_overrides": {},
+    "view_primary_keys": {}
+}
+
+
 _re_boolean_check_constraint = re.compile(r"(?:(?:.*?)\.)?(.*?) IN \(0, 1\)")
 _re_column_name = re.compile(r'(?:(["`]?)(?:.*)\1\.)?(["`]?)(.*)\2')
 _re_enum_check_constraint = re.compile(r"(?:(?:.*?)\.)?(.*?) IN \((.+)\)")
@@ -47,6 +58,10 @@ _re_invalid_identifier = re.compile(r'[^a-zA-Z0-9_]' if sys.version_info[0] < 3 
 class _DummyInflectEngine(object):
     @staticmethod
     def singular_noun(noun):
+        return noun
+
+    @staticmethod
+    def plural_noun(noun):
         return noun
 
 
@@ -198,7 +213,7 @@ class ModelClass(Model):
 
     def __init__(self, table, association_tables, inflect_engine, detect_joined):
         super(ModelClass, self).__init__(table)
-        self.name = self._tablename_to_classname(table.name, inflect_engine)
+        self.name = self._tablename_to_classname(table, inflect_engine)
         self.children = []
         self.attributes = OrderedDict()
 
@@ -206,11 +221,12 @@ class ModelClass(Model):
         for column in table.columns:
             self._add_attribute(column.name, column)
 
+        relationships = []
         # Add many-to-one relationships
         pk_column_names = set(col.name for col in table.primary_key.columns)
         for constraint in sorted(table.constraints, key=_get_constraint_sort_key):
             if isinstance(constraint, ForeignKeyConstraint):
-                target_cls = self._tablename_to_classname(constraint.elements[0].column.table.name,
+                target_cls = self._tablename_to_classname(constraint.elements[0].column.table,
                                                           inflect_engine)
                 if (detect_joined and self.parent_name == 'Base' and
                         set(_get_column_names(constraint)) == pk_column_names):
@@ -218,7 +234,7 @@ class ModelClass(Model):
                 else:
                     relationship_ = ManyToOneRelationship(self.name, target_cls, constraint,
                                                           inflect_engine)
-                    self._add_attribute(relationship_.preferred_name, relationship_)
+                    relationships.append(relationship_)
 
         # Add many-to-many relationships
         for association_table in association_tables:
@@ -226,23 +242,83 @@ class ModelClass(Model):
                               if isinstance(c, ForeignKeyConstraint)]
             fk_constraints.sort(key=_get_constraint_sort_key)
             target_cls = self._tablename_to_classname(
-                fk_constraints[1].elements[0].column.table.name, inflect_engine)
-            relationship_ = ManyToManyRelationship(self.name, target_cls, association_table)
-            self._add_attribute(relationship_.preferred_name, relationship_)
+                fk_constraints[1].elements[0].column.table, inflect_engine)
+            relationship_ = ManyToManyRelationship(self.name, target_cls, association_table, inflect_engine)
+            relationships.append(relationship_)
+
+        preferred_names = defaultdict(list)
+        for relationship_ in relationships:
+            preferred_names[relationship_.preferred_name].append(relationship_)
+
+        for key in preferred_names:
+            for relationship_ in preferred_names[key]:
+                if len(preferred_names[key]) > 1:
+                    self._add_attribute(None, relationship_)
+                else:
+                    self._add_attribute(relationship_.preferred_name, relationship_)
 
     @classmethod
-    def _tablename_to_classname(cls, tablename, inflect_engine):
-        tablename = cls._convert_to_valid_identifier(tablename)
-        camel_case_name = ''.join(part[:1].upper() + part[1:] for part in tablename.split('_'))
+    def _tablename_to_classname(cls, table, inflect_engine):
+        if table.schema == config["default_schema"]:
+            table_name = cls._convert_to_valid_identifier(table.name)
+        else:
+            table_schema = table.schema.lower().title()
+            table_name = cls._convert_to_valid_identifier(
+                table_schema + "_" + table.name)
+        camel_case_name = ''.join(part[:1].upper() + part[1:] for part in table_name.split('_'))
         return inflect_engine.singular_noun(camel_case_name) or camel_case_name
 
+    def _convert_column_name(self, col_name):
+        col_name = inflection.underscore(col_name)
+        return col_name
+
     def _add_attribute(self, attrname, value):
-        attrname = tempname = self._convert_to_valid_identifier(attrname)
+        if isinstance(value, Column):
+            table_name = value.table.name + "." + value.name
+            full_name = value.table.schema + "." + table_name
+            if full_name in config["column_name_overrides"]:
+                return config["column_name_overrides"][full_name]
+            elif table_name in config["column_name_overrides"]:
+                return config["column_name_overrides"][table_name]
+            elif value.name in config["column_name_overrides"]:
+                return config["column_name_overrides"][value.name]
+            attrname = self._convert_column_name(attrname)
+            attrname = tempname = self._convert_to_valid_identifier(attrname)
+        elif attrname is None:
+            source_col = value.kwargs.pop("source_col_name")
+            target_col = value.kwargs.pop("target_col_name")
+            name_base = source_col
+            if name_base.endswith(target_col):
+                name_base = source_col[:-len(target_col)]
+            if name_base.lower().endswith("id"):
+                name_base = name_base[:-2]
+            if name_base.endswith(target_col):
+                # removing ID may have changed things...
+                name_base = name_base[:-len(target_col)]
+            if len(name_base) == 0:
+                name_base = source_col
+                if len(name_base) > 2 and name_base.lower().endswith("id"):
+                    name_base = name_base[:-2]
+            # first see if converted name_base already in attrs
+            orig_name_base = name_base
+            converted_name_base = self._convert_column_name(
+                self._convert_to_valid_identifier(name_base))
+            if converted_name_base in self.attributes:
+                name_base = name_base + "_" + value.preferred_name
+            attrname = self._convert_column_name(name_base)
+            attrname = tempname = self._convert_to_valid_identifier(attrname)
+            value.backref_name = self._convert_to_valid_identifier(
+                self._convert_column_name(
+                    orig_name_base
+                )
+            ) + "_" + value.backref_name
+        else:
+            attrname = self._convert_column_name(attrname)
+            attrname = tempname = self._convert_to_valid_identifier(attrname)
         counter = 1
         while tempname in self.attributes:
             tempname = attrname + str(counter)
             counter += 1
-
         self.attributes[tempname] = value
         return tempname
 
@@ -257,16 +333,28 @@ class ModelClass(Model):
 
 
 class Relationship(object):
-    def __init__(self, source_cls, target_cls):
+    def __init__(self, source_cls, target_cls, inflect_engine):
         super(Relationship, self).__init__()
         self.source_cls = source_cls
         self.target_cls = target_cls
         self.kwargs = OrderedDict()
+        self.backref_name = inflection.underscore(source_cls)
+
+    def make_backref(self, relationships):
+        backref = orig_backref = self.backref_name
+        # If backref with this name already in relationships
+        # Add a number at the end to distinguish
+        counter = 0
+        while (self.target_cls, backref) in [(
+                r.target_cls, r.backref_name) for r in relationships]:
+            backref = orig_backref + '_' + str(counter)
+            counter += 1
+        self.kwargs['backref'] = repr(backref)
 
 
 class ManyToOneRelationship(Relationship):
     def __init__(self, source_cls, target_cls, constraint, inflect_engine):
-        super(ManyToOneRelationship, self).__init__(source_cls, target_cls)
+        super(ManyToOneRelationship, self).__init__(source_cls, target_cls, inflect_engine)
 
         column_names = _get_column_names(constraint)
         colname = column_names[0]
@@ -275,7 +363,7 @@ class ManyToOneRelationship(Relationship):
             self.preferred_name = inflect_engine.singular_noun(tablename) or tablename
         else:
             self.preferred_name = colname[:-3]
-
+        self.backref_name = inflect_engine.plural_noun(self.backref_name)
         # Add uselist=False to One-to-One relationships
         if any(isinstance(c, (PrimaryKeyConstraint, UniqueConstraint)) and
                set(col.name for col in c.columns) == set(column_names)
@@ -295,6 +383,8 @@ class ManyToOneRelationship(Relationship):
         if len(common_fk_constraints) > 1:
             self.kwargs['primaryjoin'] = "'{0}.{1} == {2}.{3}'".format(
                 source_cls, column_names[0], target_cls, constraint.elements[0].column.name)
+            self.kwargs['source_col_name'] = column_names[0]
+            self.kwargs['target_col_name'] = constraint.elements[0].column.name
 
     @staticmethod
     def get_common_fk_constraints(table1, table2):
@@ -307,8 +397,8 @@ class ManyToOneRelationship(Relationship):
 
 
 class ManyToManyRelationship(Relationship):
-    def __init__(self, source_cls, target_cls, assocation_table):
-        super(ManyToManyRelationship, self).__init__(source_cls, target_cls)
+    def __init__(self, source_cls, target_cls, assocation_table, inflect_engine):
+        super(ManyToManyRelationship, self).__init__(source_cls, target_cls, inflect_engine)
 
         prefix = (assocation_table.schema + '.') if assocation_table.schema else ''
         self.kwargs['secondary'] = repr(prefix + assocation_table.name)
@@ -318,6 +408,7 @@ class ManyToManyRelationship(Relationship):
         colname = _get_column_names(constraints[1])[0]
         tablename = constraints[1].elements[0].column.table.name
         self.preferred_name = tablename if not colname.endswith('_id') else colname[:-3] + 's'
+        self.backref_name = inflect_engine.plural_noun(self.backref_name)
 
         # Handle self referential relationships
         if source_cls == target_cls:
@@ -430,7 +521,11 @@ class CodeGenerator(object):
 
             # Only form model classes for tables that have a primary key and are not association
             # tables
-            if noclasses or not table.primary_key or table.name in association_tables:
+            table_schema = table.schema or config["default_schema"]
+            full_table_name = table_schema + "." + table.name
+            if noclasses or table.name in association_tables or (
+                    not table.primary_key and
+                    full_table_name not in config["view_primary_keys"]):
                 model = self.table_model(table)
             else:
                 model = self.class_model(table, links[table.name], self.inflect_engine,
@@ -445,6 +540,14 @@ class CodeGenerator(object):
             if model.parent_name != 'Base':
                 classes[model.parent_name].children.append(model)
                 self.models.remove(model)
+
+        # Handle creating backrefs
+        for model in classes.values():
+            handled_relationships = []
+            for relationship in model.attributes.values():
+                if isinstance(relationship, Relationship):
+                    relationship.make_backref(handled_relationships)
+                    handled_relationships.append(relationship)
 
         # Add either the MetaData or declarative_base import depending on whether there are mapped
         # classes or not
@@ -562,7 +665,16 @@ class CodeGenerator(object):
 
     def render_column(self, column, show_name):
         kwarg = []
-        is_sole_pk = column.primary_key and len(column.table.primary_key) == 1
+        primary_key = column.primary_key
+        if not primary_key:
+            view_schema = column.table.schema or config["default_schema"]
+            table_name = view_schema + "." + column.table.name
+            primary_key_cols = config["view_primary_keys"].get(table_name)
+            if primary_key_cols and column.name in primary_key_cols:
+                primary_key = True
+            is_sole_pk = primary_key and len(primary_key_cols) == 1
+        else:
+            is_sole_pk = column.primary_key and len(column.table.primary_key) == 1
         dedicated_fks = [c for c in column.foreign_keys if len(c.constraint.columns) == 1]
         is_unique = any(isinstance(c, UniqueConstraint) and set(c.columns) == {column}
                         for c in column.table.constraints)
@@ -577,7 +689,7 @@ class CodeGenerator(object):
 
         if column.key != column.name:
             kwarg.append('key')
-        if column.primary_key:
+        if primary_key:
             kwarg.append('primary_key')
         if not column.nullable and not is_sole_pk:
             kwarg.append('nullable')
@@ -609,10 +721,11 @@ class CodeGenerator(object):
         return 'Column({0})'.format(', '.join(
             ([repr(column.name)] if show_name else []) +
             ([self.render_column_type(column.type)] if render_coltype else []) +
+            ([server_default] if server_default and server_default.startswith("Computed") else []) +
             [self.render_constraint(x) for x in dedicated_fks] +
             [repr(x) for x in column.constraints] +
             ['{0}={1}'.format(k, repr(getattr(column, k))) for k in kwarg] +
-            ([server_default] if server_default else []) +
+            ([server_default] if server_default and not server_default.startswith("Computed") else []) +
             (['comment={!r}'.format(comment)] if comment and not self.nocomments else [])
         ))
 
@@ -702,7 +815,7 @@ class CodeGenerator(object):
         rendered += '\n'
         for attr, column in model.attributes.items():
             if isinstance(column, Column):
-                show_name = attr != column.name
+                show_name = True
                 rendered += '{0}{1} = {2}\n'.format(
                     self.indentation, attr, self.render_column(column, show_name))
 

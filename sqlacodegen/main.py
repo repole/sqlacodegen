@@ -8,7 +8,7 @@ import pkg_resources
 from sqlalchemy.engine import create_engine
 from sqlalchemy.schema import MetaData
 
-from sqlacodegen.codegen import CodeGenerator
+from sqlacodegen.codegen import CodeGenerator, config
 
 
 def main():
@@ -41,10 +41,16 @@ def main():
         return
 
     # Use reflection to fill in the metadata
+    default_schema = config["default_schema"]
+    if args.schema:
+        schemas = args.schema.split(",")
+    else:
+        schemas = [default_schema]
     engine = create_engine(args.url)
     metadata = MetaData(engine)
     tables = args.tables.split(',') if args.tables else None
-    metadata.reflect(engine, args.schema, not args.noviews, tables)
+    for schema in schemas:
+        metadata.reflect(engine, schema, not args.noviews, tables)
 
     # Write the generated model code to the specified file or standard output
     outfile = io.open(args.outfile, 'w', encoding='utf-8') if args.outfile else sys.stdout
