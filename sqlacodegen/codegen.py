@@ -43,8 +43,9 @@ except ImportError:
 # Will allow for view relationships...
 config = {
     "default_schema": "public",
-    "tables": {},
+    "tables": {}
 }
+
 
 
 _re_boolean_check_constraint = re.compile(r"(?:(?:.*?)\.)?(.*?) IN \(0, 1\)")
@@ -364,6 +365,10 @@ class ModelClass(Model):
             tempname = attrname + str(counter)
             counter += 1
         self.attributes[tempname] = value
+        with suppress(KeyError):
+            value.kwargs.pop("source_col_name")
+        with suppress(KeyError):
+            value.kwargs.pop("target_col_name")
         return tempname
 
     def add_imports(self, collector):
@@ -422,9 +427,15 @@ class ManyToOneRelationship(Relationship):
 
         # Handle self referential relationships
         if source_cls == target_cls:
-            self.preferred_name = 'parent' if not colname.endswith('_id') else colname[:-3]
+            if colname.lower().endswith('_id'):
+                self.preferred_name = colname[:-3]
+            elif colname.endswith("Id") or colname.endswith("ID"):
+                self.preferred_name = colname[:-2]
+            else:
+                self.preferred_name = "parent"
             pk_col_names = [col.name for col in constraint.table.primary_key]
-            self.kwargs['remote_side'] = '[{0}]'.format(', '.join(pk_col_names))
+            self.kwargs['remote_side'] = '[{0}]'.format(
+                ', '.join([inflection.underscore(pk) for pk in pk_col_names]))
 
         # If the two tables share more than one foreign key constraint,
         # SQLAlchemy needs an explicit primaryjoin to figure out which column(s) to join with
@@ -576,7 +587,7 @@ class CodeGenerator(object):
             table_config = config.get("tables", {}).get(full_table_name, {})
             if noclasses or table.name in association_tables or (
                     not table.primary_key and
-                    not table_config.get("view_primary_keys", {})):
+                    not table_config.get("custom_primary_keys", {})):
                 model = self.table_model(table)
             else:
                 model = self.class_model(table, links[table.name], self.inflect_engine,
@@ -720,9 +731,10 @@ class CodeGenerator(object):
             view_schema = column.table.schema or config["default_schema"]
             table_name = view_schema + "." + column.table.name
             table_config = config.get("tables", {}).get(table_name, {})
-            primary_key_cols = table_config.get("view_primary_keys", [])
+            primary_key_cols = table_config.get("custom_primary_keys", [])
             if primary_key_cols and column.name in primary_key_cols:
                 primary_key = True
+                column.primary_key = True
             is_sole_pk = primary_key and len(primary_key_cols) == 1
         else:
             is_sole_pk = column.primary_key and len(column.table.primary_key) == 1
@@ -887,7 +899,7 @@ class CodeGenerator(object):
                 rendered += '{0}{1} = {2}\n'.format(
                     self.indentation, attr, custom_relationships.get(attr))
         for attr in custom_relationships:
-            if attr not in model.attributes.items():
+            if attr not in model.attributes.items() and custom_relationships.get(attr):
                 rendered += '{0}{1} = {2}\n'.format(
                     self.indentation, attr, custom_relationships.get(attr))
 
